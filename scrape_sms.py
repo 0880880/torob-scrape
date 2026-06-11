@@ -237,13 +237,13 @@ async def process_website(
         async def on_request(request: Request):
             if is_listening:
                 req_data = {
-                    "url": request.url,
-                    "method": request.method,
-                    "headers": request.headers,  # Fixed: Keep headers as a dict, don't json.dumps
+                    "URL": request.url,
+                    "Method": request.method,
+                    "Headers": request.headers,  # Fixed: Keep headers as a dict, don't json.dumps
                 }
                 if request.post_data:
-                    req_data["payload"] = request.post_data
-                captured_requests.append(req_data)
+                    req_data["Payload"] = request.post_data
+                captured_requests.append({"Type": "sms", "Request": req_data})
 
         page.on("request", on_request)
 
@@ -397,11 +397,11 @@ async def process_website(
 
                     parsed = json.loads(req_str)
                     if len(csrf) > 0:
-                        parsed["has_csrf"] = True
-                        parsed["csrf"] = csrf
-                        parsed["csrf_page"] = csrf_page
+                        parsed["HasCSRF"] = True
+                        parsed["CSRF"] = csrf
+                        parsed["CSRFPage"] = csrf_page
                     else:
-                        parsed["has_csrf"] = False
+                        parsed["HasCSRF"] = False
 
                     # Store parsed dict directly into sms_requests list
                     sms_requests.append(parsed)
