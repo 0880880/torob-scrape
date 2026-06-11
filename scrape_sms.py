@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import shutil
+import urllib.parse
 from pathlib import Path
 
 from playwright.async_api import (
@@ -17,13 +18,73 @@ from playwright_stealth import Stealth
 
 from stealth import human_click, human_type
 
+CSRF_KEY_RE = re.compile(
+    r"csrf|xsrf|token|nonce|authenticity|_wpnonce|csrfmiddlewaretoken|yii_csrf",
+    re.IGNORECASE,
+)
+
+
+def extract_csrf_from_request(req_data: dict) -> list:
+    """Find CSRF tokens directly inside the captured request (headers + payload)."""
+    found = []
+
+    # --- Headers ---
+    headers = req_data.get("Headers", {}) or {}
+    for k, v in headers.items():
+        if CSRF_KEY_RE.search(k) and v and len(v) > 3:
+            found.append(
+                {
+                    "type": "request_header",
+                    "name": k,
+                    "value": v,
+                    "selector": "N/A (Request Header)",
+                }
+            )
+
+    # --- Payload ---
+    payload = req_data.get("Payload")
+    if payload:
+        # Try JSON
+        try:
+            data = json.loads(payload)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if CSRF_KEY_RE.search(str(k)) and isinstance(v, str) and len(v) > 3:
+                        found.append(
+                            {
+                                "type": "json_payload",
+                                "name": k,
+                                "value": v,
+                                "selector": "N/A (JSON Body)",
+                            }
+                        )
+        except (json.JSONDecodeError, TypeError):
+            # Try urlencoded form
+            try:
+                parsed = urllib.parse.parse_qs(payload, keep_blank_values=True)
+                for k, vals in parsed.items():
+                    if CSRF_KEY_RE.search(k):
+                        for v in vals:
+                            if v and len(v) > 3:
+                                found.append(
+                                    {
+                                        "type": "form_payload",
+                                        "name": k,
+                                        "value": v,
+                                        "selector": "N/A (Form Body)",
+                                    }
+                                )
+            except Exception:
+                pass
+
+    return found
+
 
 async def extract_csrf_from_page(page: Page) -> list:
     detection_script = """
     () => {
         const tokens = [];
 
-        // Helper to generate a precise absolute CSS selector for an element
         function getAbsoluteSelector(el) {
             if (!(el instanceof Element)) return null;
             const path = [];
@@ -32,7 +93,7 @@ async def extract_csrf_from_page(page: Page) -> list:
                 if (el.id) {
                     selector += '#' + el.id;
                     path.unshift(selector);
-                    break; // ID is unique, stop traversing up
+                    break;
                 } else {
                     let sib = el, nth = 1;
                     while (sib = sib.previousElementSibling) {
@@ -48,46 +109,26 @@ async def extract_csrf_from_page(page: Page) -> list:
             return path.join(' > ');
         }
 
-        // Patterns to match against names, IDs, and attributes
-        const csrfPatterns = [
-            /csrf/i, /xsrf/i, /token/i, /nonce/i, /authenticity/i, /altcha/i,
-            /security/i, /_wpnonce/i, /csrfmiddlewaretoken/i, /YII_CSRF_TOKEN/i
-        ];
-
-        function matchesPatterns(str) {
-            if (!str) return false;
-            return csrfPatterns.some(regex => regex.test(str));
-        }
-
-        // 1. Scan <meta> tags
-        const metas = document.querySelectorAll('meta');
-        metas.forEach(meta => {
+        const csmeta => {
             const name = meta.getAttribute('name') || meta.getAttribute('property') || '';
             const content = meta.getAttribute('content') || '';
-            
-            if (matchesPatterns(name) && content.length > 5) {
+            if (matchesPatterns(name) && content.length > 3) {
                 tokens.push({
-                    type: 'meta',
-                    name: name,
-                    value: content,
+                    type: 'meta', name, value: content,
                     element_html: meta.outerHTML,
                     selector: getAbsoluteSelector(meta)
                 });
             }
         });
 
-        // 2. Scan <input> elements (hidden/visible fields)
-        const inputs = document.querySelectorAll('input');
-        inputs.forEach(input => {
+        // 2. <input> elements (NOTE: lowered length threshold to > 3)
+        document.querySelectorAll('input').forEach(input => {
             const name = input.getAttribute('name') || '';
             const id = input.getAttribute('id') || '';
             const value = input.value || '';
-
-            if ((matchesPatterns(name) || matchesPatterns(id)) && value.length > 5) {
+            if ((matchesPatterns(name) || matchesPatterns(id)) && value.length > 3) {
                 tokens.push({
-                    type: 'input',
-                    name: name || id,
-                    value: value,
+                    type: 'input', name: name || id, value,
                     input_type: input.getAttribute('type') || 'text',
                     element_html: input.outerHTML,
                     selector: getAbsoluteSelector(input)
@@ -95,18 +136,30 @@ async def extract_csrf_from_page(page: Page) -> list:
             }
         });
 
-        // 3. Scan common global JS variables
+        // 3. Global JS variables
         const commonGlobalKeys = [
             'csrf_token', 'csrfToken', 'CSRF_TOKEN', '_csrf', 'wp_nonce', 'securityToken'
         ];
         commonGlobalKeys.forEach(key => {
             if (window[key] && typeof window[key] === 'string') {
                 tokens.push({
-                    type: 'javascript_global',
-                    name: key,
-                    value: window[key],
+                    type: 'javascript_global', name: key, value: window[key],
                     element_html: `window.${key}`,
                     selector: 'N/A (Global JS Variable)'
+                });
+            }
+        });
+
+        // 4. Cookies (XSRF-TOKEN etc.)
+        document.cookie.split(';').forEach(c => {
+            const [rawName, ...rest] = c.split('=');
+            const name = (rawName || '').trim();
+            const value = decodeURIComponent((rest.join('=') || '').trim());
+            if (matchesPatterns(name) && value.length > 3) {
+                tokens.push({
+                    type: 'cookie', name, value,
+                    element_html: `document.cookie[${name}]`,
+                    selector: 'N/A (Cookie)'
                 });
             }
         });
@@ -114,7 +167,6 @@ async def extract_csrf_from_page(page: Page) -> list:
         return tokens;
     }
     """
-
     try:
         return await page.evaluate(detection_script)
     except Exception as e:
@@ -385,28 +437,44 @@ async def process_website(
 
             found = False
             for req_dict in captured_requests:
-                # Stringify dictionary temporarily to search for phone number and tokens
                 req_str = json.dumps(req_dict)
-                if phone_number in req_str:
-                    req_str = req_str.replace(phone_number, "{{phone_number}}")
-                    if len(csrf) > 0:
-                        for idx, c in enumerate(csrf):
-                            req_str = req_str.replace(
-                                c["value"], f"{{{{csrf_token{idx}}}}}"
-                            )
+                if phone_number not in req_str:
+                    continue
 
-                    parsed = json.loads(req_str)
-                    if len(csrf) > 0:
-                        parsed["HasCSRF"] = True
-                        parsed["CSRF"] = csrf
-                        parsed["CSRFPage"] = csrf_page
-                    else:
-                        parsed["HasCSRF"] = False
+                # Combine DOM-scraped tokens with tokens found inside THIS request
+                request_csrf = extract_csrf_from_request(req_dict.get("Request", {}))
 
-                    # Store parsed dict directly into sms_requests list
-                    sms_requests.append(parsed)
-                    found = True
-                    break
+                # Dedupe by value, preferring request-level (most reliable)
+                all_tokens = {}
+                for t in request_csrf + csrf:
+                    if t["value"] not in all_tokens:
+                        all_tokens[t["value"]] = t
+                merged_csrf = list(all_tokens.values())
+
+                req_str = req_str.replace(phone_number, "{{phone_number}}")
+
+                used_tokens = []
+                for c in merged_csrf:
+                    val = c["value"]
+                    # Only template tokens that ACTUALLY appear in the request
+                    if val and val in req_str:
+                        idx = len(used_tokens)
+                        req_str = req_str.replace(val, f"{{{{csrf_token{idx}}}}}")
+                        used_tokens.append(c)
+
+                parsed = json.loads(req_str)
+
+                if used_tokens:
+                    parsed["HasCSRF"] = True
+                    parsed["CSRF"] = used_tokens
+                    parsed["CSRFPage"] = csrf_page
+                else:
+                    parsed["HasCSRF"] = False
+
+                sms_requests.append(parsed)
+                found = True
+                break
+
             if not found:
                 failed.append(url)
                 logs = Path("./logs")
