@@ -25,13 +25,30 @@ async def fetch_page(
     sem: asyncio.Semaphore,
     page: int,
     size: int,
+    max_retries: int = 5,
+    base_delay: float = 1.0,
 ) -> list[str]:
     async with sem:
-        resp = await client.get(get_torob_url(page, size))
-        resp.raise_for_status()
-        data = resp.json()
-        print(f"Page {page:03}")
-        return ["https://" + shop["domain"] for shop in data["results"]]
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = await client.get(get_torob_url(page, size))
+                resp.raise_for_status()
+                data = resp.json()
+                print(f"Page {page:03}")
+                return ["https://" + shop["domain"] for shop in data["results"]]
+            except (httpx.HTTPError, json.JSONDecodeError) as e:
+                if attempt == max_retries:
+                    print(f"Page {page:03} FAILED after {max_retries} attempts: {e}")
+                    raise
+                delay = base_delay * (2 ** (attempt - 1))
+                print(
+                    f"Page {page:03} attempt {attempt} failed ({e}); "
+                    f"retrying in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+
+    # Unreachable, but keeps type checkers happy
+    return []
 
 
 async def main() -> None:
