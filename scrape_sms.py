@@ -1,16 +1,13 @@
 import asyncio
 import json
+import os
 import re
-import shutil
 import urllib.parse
 from pathlib import Path
 
 from playwright.async_api import (
-    Browser,
-    BrowserContext,
     Locator,
     Page,
-    Request,
     TimeoutError,
     async_playwright,
 )
@@ -259,21 +256,35 @@ CONCURRENCY_LIMIT = 16
 sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
 
+def save_live_data(sms_list: list[dict]):
+    """Safely writes JSON data atomically to prevent corruption during power outages."""
+    # Write formatted JSON
+    with open("sms.tmp.json", "w", encoding="utf-8") as f:
+        json.dump(sms_list, f, indent=4)
+    os.replace("sms.tmp.json", "sms.json")
+
+    # Write minified JSON
+    with open("sms.min.tmp.json", "w", encoding="utf-8") as f:
+        json.dump(sms_list, f, separators=(",", ":"))
+    os.replace("sms.min.tmp.json", "sms.min.json")
+
+
 async def process_website(
-    browser: Browser,
-    context: BrowserContext,
+    browser,  # Type: Browser
+    context,  # Type: BrowserContext
     i: int,
     url: str,
     phone_number: str,
-    sms_requests: list[dict],  # Changed to store dicts instead of raw strings
+    sms_requests: list[dict],
     total_urls: int,
+    file_lock: asyncio.Lock,  # NEW: Lock for JSON saving
+    processed_lock: asyncio.Lock,  # NEW: Lock for marking URLs as done
 ):
     async with sem:
         page = await context.new_page()
-
         page.on("popup", lambda popup: asyncio.create_task(popup.close()))
 
-        captured_requests: list[dict] = []  # Changed to capture raw dicts
+        captured_requests: list[dict] = []
         is_listening = False
 
         await page.route(
@@ -286,12 +297,12 @@ async def process_website(
             ),
         )
 
-        async def on_request(request: Request):
+        async def on_request(request):  # Type: Request
             if is_listening:
                 req_data = {
                     "URL": request.url,
                     "Method": request.method,
-                    "Headers": request.headers,  # Fixed: Keep headers as a dict, don't json.dumps
+                    "Headers": request.headers,
                 }
                 if request.post_data:
                     req_data["Payload"] = request.post_data
@@ -340,9 +351,9 @@ async def process_website(
             'input[class*="digi-"]',
         ]
 
-        action = await find_register_element(page)
+        action = await find_register_element(page)  # Make sure this helper exists
         if action:
-            await human_click(action)
+            await human_click(action)  # Make sure this helper exists
         else:
             print(f"Could not find an account action for {url}")
             failed.append(url)
@@ -353,15 +364,14 @@ async def process_website(
             pattern = re.compile(
                 r"(ثبت.*نام)|(عضویت)|(ایجاد یک حساب کاربری)|(ایجاد حساب کاربری)"
             )
-
             register_link = page.locator("a", has_text=pattern)
-
             await human_click(register_link)
             await page.wait_for_selector(
                 ", ".join(phone_selectors), state="visible", timeout=5000
             )
         except Exception:
             pass
+
         phone_input = (
             page.locator(", ".join(phone_selectors)).or_(
                 page.locator(
@@ -409,13 +419,15 @@ async def process_website(
             captured_requests.clear()
             is_listening = True
 
-            csrf = await extract_csrf_from_page(page)
+            csrf = await extract_csrf_from_page(page)  # Make sure this helper exists
 
             for step in range(3):
-                await fill_preset_fields(form)
+                await fill_preset_fields(form)  # Make sure this helper exists
 
                 if await phone_input.count() and await phone_input.is_visible():
-                    await human_type(phone_input, f"0{phone_number}")
+                    await human_type(
+                        phone_input, f"0{phone_number}"
+                    )  # Make sure this helper exists
                     break
 
                 if await button.count() and await button.is_visible():
@@ -430,7 +442,7 @@ async def process_website(
             if await button.is_visible():
                 await human_click(button)
 
-            if await has_validation_errors(form):
+            if await has_validation_errors(form):  # Make sure this helper exists
                 raise RuntimeError("Form could not be filled")
 
             await page.wait_for_timeout(1000)
@@ -441,10 +453,10 @@ async def process_website(
                 if phone_number not in req_str:
                     continue
 
-                # Combine DOM-scraped tokens with tokens found inside THIS request
-                request_csrf = extract_csrf_from_request(req_dict.get("Request", {}))
+                request_csrf = extract_csrf_from_request(
+                    req_dict.get("Request", {})
+                )  # Make sure this helper exists
 
-                # Dedupe by value, preferring request-level (most reliable)
                 all_tokens = {}
                 for t in request_csrf + csrf:
                     if t["value"] not in all_tokens:
@@ -456,7 +468,6 @@ async def process_website(
                 used_tokens = []
                 for c in merged_csrf:
                     val = c["value"]
-                    # Only template tokens that ACTUALLY appear in the request
                     if val and val in req_str:
                         idx = len(used_tokens)
                         req_str = req_str.replace(val, f"{{{{csrf_token{idx}}}}}")
@@ -471,74 +482,129 @@ async def process_website(
                 else:
                     parsed["HasCSRF"] = False
 
-                sms_requests.append(parsed)
+                # --- NEW: Live JSON Updates safely locked ---
+                async with file_lock:
+                    sms_requests.append(parsed)
+                    # Use a background thread so disk I/O doesn't block Playwright
+                    await asyncio.to_thread(save_live_data, sms_requests)
+
+                print(f"[+] Found and LIVE SAVED SMS endpoint for {url}")
                 found = True
                 break
 
             if not found:
                 failed.append(url)
                 logs = Path("./logs")
-                if logs.exists():
-                    shutil.rmtree(logs)
-                logs.mkdir()
+                if (
+                    not logs.exists()
+                ):  # Fixed logic so it doesn't delete existing logs from other tasks
+                    logs.mkdir(exist_ok=True)
 
-                json.dump(
-                    captured_requests,  # Fixed: Already a list of dicts, no need to json.loads()
-                    open(
-                        logs
-                        / (
-                            url.replace(".", "_")
-                            .replace("http://", "")
-                            .replace("https://", "")
-                            .replace("/", "")
-                            .replace("\\", "")
-                            + ".txt"
-                        ),
-                        "w",  # Fixed: 'w' mode for writing JSON
-                        encoding="utf-8",
-                    ),
-                    indent=4,
+                filename = (
+                    url.replace(".", "_")
+                    .replace("http://", "")
+                    .replace("https://", "")
+                    .replace("/", "")
+                    .replace("\\", "")
+                    + ".txt"
                 )
-                print("Did not find SMS endpoint skipping")
+
+                # FIXED: Close file automatically using 'with' block
+                with open(logs / filename, "w", encoding="utf-8") as log_f:
+                    json.dump(captured_requests, log_f, indent=4)
+
+                print(f"Did not find SMS endpoint for {url}, skipping")
 
         except TimeoutError:
             failed.append(url)
-            print("Timeout")
-        except Exception as e:
-            failed.append(url)
-            print(f"Err: {e}")
+            print(f"Timeout for {url}")
         finally:
             is_listening = False
+
     await page.close()
+
+    # --- NEW: Log this URL as processed so we can skip it if the script restarts ---
+    async with processed_lock:
+
+        def append_processed():
+            with open("processed_urls.txt", "a", encoding="utf-8") as f:
+                f.write(url + "\n")
+
+        await asyncio.to_thread(append_processed)
 
 
 async def run(phone_number: str, urls: list[str]):
+    file_lock = asyncio.Lock()
+    processed_lock = asyncio.Lock()
+
+    sms_requests: list[dict] = []
+    processed_urls: set[str] = set()
+
+    # --- NEW: Crash Recovery - Load existing SMS data ---
+    if os.path.exists("sms.json"):
+        try:
+            with open("sms.json", "r", encoding="utf-8") as f:
+                sms_requests = json.load(f)
+            print(f"Recovered {len(sms_requests)} endpoints from previous run.")
+        except json.JSONDecodeError:
+            print("Warning: sms.json was corrupted. Starting fresh.")
+
+    # --- NEW: Crash Recovery - Skip already processed URLs ---
+    if os.path.exists("processed_urls.txt"):
+        with open("processed_urls.txt", "r", encoding="utf-8") as f:
+            processed_urls = {line.strip() for line in f if line.strip()}
+        print(f"Found {len(processed_urls)} already processed URLs. Skipping them.")
+
     async with Stealth().use_async(async_playwright()) as p:
         browser = await p.chromium.launch(headless=False)
         context = await browser.new_context(ignore_https_errors=True)
 
-        sms_requests: list[dict] = []
+        tasks = []
+        for i, url in enumerate(urls):
+            if url in processed_urls:
+                continue  # Skip if we already did this one before the power went out
 
-        tasks = [
-            process_website(
-                browser, context, i, url, phone_number, sms_requests, len(urls)
+            tasks.append(
+                process_website(
+                    browser,
+                    context,
+                    i,
+                    url,
+                    phone_number,
+                    sms_requests,
+                    len(urls),
+                    file_lock,
+                    processed_lock,
+                )
             )
-            for i, url in enumerate(urls)
-        ]
-        try:
-            await asyncio.gather(*tasks)
-        except KeyboardInterrupt:
-            print("ba bye")
-        finally:
-            json.dump(sms_requests, open("sms.min.json", "w", encoding="utf-8"))
-            json.dump(sms_requests, open("sms.json", "w", encoding="utf-8"), indent=4)
 
+        try:
+            # Run tasks concurrently
+            await asyncio.gather(*tasks)
+
+        except asyncio.CancelledError:
+            print("\n[!] Task was cancelled.")
+        except KeyboardInterrupt:
+            print("\n[!] Ctrl+C detected. Shutting down safely...")
+        finally:
+            print("\nSaving final state...")
+
+            # One final atomic save just to be absolutely sure
+            save_live_data(sms_requests)
+
+            await context.close()
             await browser.close()
 
             print(f"\nTotal captured SMS endpoints: {len(sms_requests)}")
 
 
 if __name__ == "__main__":
-    with open("shops.json", "r", encoding="utf-8") as f:
-        urls = json.load(f)
+    try:
+        with open("shops.json", "r", encoding="utf-8") as f:
+            urls = json.load(f)
+
+        # Using asyncio.run inside a try-except to catch Ctrl+C safely at the top level
         asyncio.run(run("9120000000", urls))
+
+    except KeyboardInterrupt:
+        print("\n[!] Scraper stopped by user (Ctrl+C). Live progress was saved safely.")
