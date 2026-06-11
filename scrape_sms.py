@@ -471,6 +471,6 @@ async def run(phone_number: str, urls: list[str]):
 
 
 if __name__ == "__main__":
-    with open("shops.txt", "r", encoding="utf-8") as f:
-        urls = [line.strip() for line in f if line.strip()]
+    with open("shops.json", "r", encoding="utf-8") as f:
+        urls = json.load(f)
         asyncio.run(run("9120000000", urls))
