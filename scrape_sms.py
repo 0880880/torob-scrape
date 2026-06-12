@@ -282,7 +282,14 @@ async def process_website(
 ):
     async with sem:
         page = await context.new_page()
-        page.on("popup", lambda popup: asyncio.create_task(popup.close()))
+
+        async def safe_close_popup(popup):
+            try:
+                await popup.close()
+            except Exception:
+                pass
+
+        page.on("popup", lambda popup: asyncio.create_task(safe_close_popup(popup)))
 
         captured_requests: list[dict] = []
         is_listening = False
@@ -555,47 +562,58 @@ async def run(phone_number: str, urls: list[str]):
             processed_urls = {line.strip() for line in f if line.strip()}
         print(f"Found {len(processed_urls)} already processed URLs. Skipping them.")
 
-    async with Stealth().use_async(async_playwright()) as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(ignore_https_errors=True)
+    try:
+        async with Stealth().use_async(async_playwright()) as p:
+            browser = await p.firefox.launch(headless=True)
+            context = await browser.new_context(ignore_https_errors=True)
 
-        tasks = []
-        for i, url in enumerate(urls):
-            if url in processed_urls:
-                continue  # Skip if we already did this one before the power went out
+            tasks = []
+            for i, url in enumerate(urls):
+                if url in processed_urls:
+                    continue  # Skip if we already did this one before the power went out
 
-            tasks.append(
-                process_website(
-                    browser,
-                    context,
-                    i,
-                    url,
-                    phone_number,
-                    sms_requests,
-                    len(urls),
-                    file_lock,
-                    processed_lock,
+                tasks.append(
+                    process_website(
+                        browser,
+                        context,
+                        i,
+                        url,
+                        phone_number,
+                        sms_requests,
+                        len(urls),
+                        file_lock,
+                        processed_lock,
+                    )
                 )
-            )
+
+            # Run tasks concurrently
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    print(f"Task error: {r!r}")
+
+    except asyncio.CancelledError:
+        print("\n[!] Task was cancelled.")
+    except KeyboardInterrupt:
+        print("\n[!] Ctrl+C detected. Shutting down safely...")
+    finally:
+        print("\nSaving final state...")
+        try:
+            save_live_data(sms_requests)
+        except Exception as e:
+            print(f"Final save failed: {e}")
 
         try:
-            # Run tasks concurrently
-            await asyncio.gather(*tasks)
-
-        except asyncio.CancelledError:
-            print("\n[!] Task was cancelled.")
-        except KeyboardInterrupt:
-            print("\n[!] Ctrl+C detected. Shutting down safely...")
-        finally:
-            print("\nSaving final state...")
-
-            # One final atomic save just to be absolutely sure
-            save_live_data(sms_requests)
-
             await context.close()
-            await browser.close()
+        except Exception as e:
+            print(f"Context close failed (already dead?): {e}")
 
-            print(f"\nTotal captured SMS endpoints: {len(sms_requests)}")
+        try:
+            await browser.close()
+        except Exception as e:
+            print(f"Browser close failed: {e}")
+
+        print(f"\nTotal captured SMS endpoints: {len(sms_requests)}")
 
 
 if __name__ == "__main__":
