@@ -553,8 +553,10 @@ async def process_website(
             print(f"Timeout for {url}")
         finally:
             is_listening = False
-
-    await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
 
     # --- NEW: Log this URL as processed so we can skip it if the script restarts ---
     async with processed_lock:
