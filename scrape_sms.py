@@ -79,17 +79,23 @@ def extract_csrf_from_request(req_data: dict) -> list:
 
 
 async def extract_csrf_from_page(page: Page) -> list:
-    detection_script = """
+    detection_script = r"""
     () => {
         const tokens = [];
+
+        // Mirror of the Python CSRF_KEY_RE
+        const CSRF_RE = /csrf|xsrf|token|nonce|authenticity|_wpnonce|csrfmiddlewaretoken|yii_csrf/i;
+        function matchesPatterns(s) {
+            return typeof s === 'string' && CSRF_RE.test(s);
+        }
 
         function getAbsoluteSelector(el) {
             if (!(el instanceof Element)) return null;
             const path = [];
-            while (el.nodeType === Node.ELEMENT_NODE) {
+            while (el && el.nodeType === Node.ELEMENT_NODE) {
                 let selector = el.nodeName.toLowerCase();
                 if (el.id) {
-                    selector += '#' + el.id;
+                    selector += '#' + CSS.escape(el.id);
                     path.unshift(selector);
                     break;
                 } else {
@@ -107,7 +113,8 @@ async def extract_csrf_from_page(page: Page) -> list:
             return path.join(' > ');
         }
 
-        const csmeta => {
+        // 1. <meta> tags  (FIXED: this loop was broken — `const csmeta =>`)
+        document.querySelectorAll('meta').forEach(meta => {
             const name = meta.getAttribute('name') || meta.getAttribute('property') || '';
             const content = meta.getAttribute('content') || '';
             if (matchesPatterns(name) && content.length > 3) {
@@ -119,7 +126,7 @@ async def extract_csrf_from_page(page: Page) -> list:
             }
         });
 
-        // 2. <input> elements (NOTE: lowered length threshold to > 3)
+        // 2. <input> elements
         document.querySelectorAll('input').forEach(input => {
             const name = input.getAttribute('name') || '';
             const id = input.getAttribute('id') || '';
@@ -139,24 +146,30 @@ async def extract_csrf_from_page(page: Page) -> list:
             'csrf_token', 'csrfToken', 'CSRF_TOKEN', '_csrf', 'wp_nonce', 'securityToken'
         ];
         commonGlobalKeys.forEach(key => {
-            if (window[key] && typeof window[key] === 'string') {
-                tokens.push({
-                    type: 'javascript_global', name: key, value: window[key],
-                    element_html: `window.${key}`,
-                    selector: 'N/A (Global JS Variable)'
-                });
-            }
+            try {
+                const val = window[key];
+                if (val && typeof val === 'string' && val.length > 3) {
+                    tokens.push({
+                        type: 'javascript_global', name: key, value: val,
+                        element_html: 'window.' + key,
+                        selector: 'N/A (Global JS Variable)'
+                    });
+                }
+            } catch (e) { /* some globals throw on access */ }
         });
 
         // 4. Cookies (XSRF-TOKEN etc.)
         document.cookie.split(';').forEach(c => {
-            const [rawName, ...rest] = c.split('=');
-            const name = (rawName || '').trim();
-            const value = decodeURIComponent((rest.join('=') || '').trim());
+            const eq = c.indexOf('=');
+            const rawName = eq === -1 ? c : c.slice(0, eq);
+            const rawVal  = eq === -1 ? '' : c.slice(eq + 1);
+            const name = rawName.trim();
+            let value = rawVal.trim();
+            try { value = decodeURIComponent(value); } catch (e) { /* leave raw */ }
             if (matchesPatterns(name) && value.length > 3) {
                 tokens.push({
                     type: 'cookie', name, value,
-                    element_html: `document.cookie[${name}]`,
+                    element_html: 'document.cookie[' + name + ']',
                     selector: 'N/A (Cookie)'
                 });
             }
