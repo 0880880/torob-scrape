@@ -285,7 +285,6 @@ def save_live_data(sms_list: list[dict]):
 
 async def process_website(
     browser,  # Type: Browser
-    context,  # Type: BrowserContext
     i: int,
     url: str,
     phone_number: str,
@@ -295,6 +294,7 @@ async def process_website(
     processed_lock: asyncio.Lock,  # NEW: Lock for marking URLs as done
 ):
     async with sem:
+        context = await browser.new_context(ignore_https_errors=True)
         page = await context.new_page()
 
         async def safe_close_popup(popup):
@@ -593,7 +593,6 @@ async def run(phone_number: str, urls: list[str]):
     try:
         async with Stealth().use_async(async_playwright()) as p:
             browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(ignore_https_errors=True)
 
             tasks = []
             for i, url in enumerate(urls):
@@ -603,7 +602,6 @@ async def run(phone_number: str, urls: list[str]):
                 tasks.append(
                     process_website(
                         browser,
-                        context,
                         i,
                         url,
                         phone_number,
