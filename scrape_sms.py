@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import re
@@ -304,16 +305,28 @@ async def process_website(
             ),
         )
 
-        async def on_request(request):  # Type: Request
-            if is_listening:
+        async def on_request(request):
+            if not is_listening:
+                return
+            try:
                 req_data = {
                     "URL": request.url,
                     "Method": request.method,
                     "Headers": request.headers,
                 }
-                if request.post_data:
-                    req_data["Payload"] = request.post_data
+
+                raw = request.post_data_buffer
+                if raw:
+                    try:
+                        req_data["Payload"] = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        req_data["Payload"] = base64.b64encode(raw).decode("ascii")
+                        req_data["PayloadEncoding"] = "base64"
+
                 captured_requests.append({"Type": "sms", "Request": req_data})
+            except Exception as e:
+                # Never let an event handler raise — it poisons the event loop
+                print(f"on_request handler error (ignored): {e!r}")
 
         page.on("request", on_request)
 
