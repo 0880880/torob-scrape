@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import re
@@ -284,279 +285,268 @@ def save_live_data(sms_list: list[dict]):
 
 
 async def process_website(
-    browser,  # Type: Browser
-    i: int,
-    url: str,
-    phone_number: str,
-    sms_requests: list[dict],
-    total_urls: int,
-    file_lock: asyncio.Lock,  # NEW: Lock for JSON saving
-    processed_lock: asyncio.Lock,  # NEW: Lock for marking URLs as done
+    browser, i, url, phone_number, sms_requests, total_urls, file_lock, processed_lock
 ):
-    async with sem:
-        context = await browser.new_context(ignore_https_errors=True)
-        page = await context.new_page()
+    context = await browser.new_context(ignore_https_errors=True)
+    page = await context.new_page()
 
-        async def safe_close_popup(popup):
-            try:
-                await popup.close()
-            except Exception:
-                pass
-
-        page.on("popup", lambda popup: asyncio.create_task(safe_close_popup(popup)))
-
-        captured_requests: list[dict] = []
-        is_listening = False
-
-        await page.route(
-            "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type
-                in ["image", "stylesheet", "font", "media"]
-                else route.continue_()
-            ),
-        )
-
-        async def on_request(request):
-            if not is_listening:
-                return
-            try:
-                req_data = {
-                    "URL": request.url,
-                    "Method": request.method,
-                    "Headers": request.headers,
-                }
-
-                raw = request.post_data_buffer
-                if raw:
-                    try:
-                        req_data["Payload"] = raw.decode("utf-8")
-                    except UnicodeDecodeError:
-                        req_data["Payload"] = base64.b64encode(raw).decode("ascii")
-                        req_data["PayloadEncoding"] = "base64"
-
-                captured_requests.append({"Type": "sms", "Request": req_data})
-            except Exception as e:
-                # Never let an event handler raise — it poisons the event loop
-                print(f"on_request handler error (ignored): {e!r}")
-
-        page.on("request", on_request)
-
-        failed: list[str] = []
-
-        print(f'Scraping "{url}" {i + 1}/{total_urls}')
+    async def safe_close_popup(popup):
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=10000)
-
-            try:
-                body_text = await page.inner_text("body", timeout=3000)
-                body_lower = body_text.lower()
-                if "suspended" in body_lower or "denied" in body_lower:
-                    print(f"Skipping {url}: Page contains 'suspended' or 'denied'")
-                    failed.append(url)
-                    await page.close()
-                    return
-            except Exception:
-                pass
-
-        except Exception as e:
-            print(f"skipping: {e}")
-            failed.append(url)
-            await page.close()
-            return
-
-        phone_selectors = [
-            'input[type="tel" i]',
-            'input[name*="phone" i]',
-            'input[name*="mobile" i]',
-            'input[name*="cell" i]',
-            'input[class*="phone" i]',
-            'input[class*="mobile" i]',
-            'input[placeholder*="تلفن"]',
-            'input[placeholder*="موبایل"]',
-            'input[placeholder*="09"]',
-            'input[id*="username" i]',
-            'input[class*="username" i]',
-            'input[type="number" i]',
-            'input[name="digits_reg_mobilenum"]',
-            'input[name="digits_phone"]',
-            'input[class*="digi-"]',
-        ]
-
-        action = await find_register_element(page)  # Make sure this helper exists
-        if action:
-            await human_click(action)  # Make sure this helper exists
-        else:
-            print(f"Could not find an account action for {url}")
-            failed.append(url)
-            await page.close()
-            return
-
-        try:
-            pattern = re.compile(
-                r"(ثبت.*نام)|(عضویت)|(ایجاد یک حساب کاربری)|(ایجاد حساب کاربری)"
-            )
-            register_link = page.locator("a", has_text=pattern)
-            await human_click(register_link)
-            await page.wait_for_selector(
-                ", ".join(phone_selectors), state="visible", timeout=5000
-            )
+            await popup.close()
         except Exception:
             pass
 
-        phone_input = (
-            page.locator(", ".join(phone_selectors)).or_(
-                page.locator(
-                    "xpath=//input["
-                    'preceding-sibling::*[contains(text(), "شماره تماس") or contains(text(), "شماره موبایل") or contains(text(), "شماره تلفن")] or '
-                    'following-sibling::*[contains(text(), "شماره تماس") or contains(text(), "شماره موبایل") or contains(text(), "شماره تلفن")]'
-                    "]"
-                )
+    page.on("popup", lambda popup: asyncio.create_task(safe_close_popup(popup)))
+
+    captured_requests: list[dict] = []
+    is_listening = False
+
+    await page.route(
+        "**/*",
+        lambda route: (
+            route.abort()
+            if route.request.resource_type in ["image", "stylesheet", "font", "media"]
+            else route.continue_()
+        ),
+    )
+
+    async def on_request(request):
+        if not is_listening:
+            return
+        try:
+            req_data = {
+                "URL": request.url,
+                "Method": request.method,
+                "Headers": request.headers,
+            }
+
+            raw = request.post_data_buffer
+            if raw:
+                try:
+                    req_data["Payload"] = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    req_data["Payload"] = base64.b64encode(raw).decode("ascii")
+                    req_data["PayloadEncoding"] = "base64"
+
+            captured_requests.append({"Type": "sms", "Request": req_data})
+        except Exception as e:
+            # Never let an event handler raise — it poisons the event loop
+            print(f"on_request handler error (ignored): {e!r}")
+
+    page.on("request", on_request)
+
+    failed: list[str] = []
+
+    print(f'Scraping "{url}" {i + 1}/{total_urls}')
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=10000)
+
+        try:
+            body_text = await page.inner_text("body", timeout=3000)
+            body_lower = body_text.lower()
+            if "suspended" in body_lower or "denied" in body_lower:
+                print(f"Skipping {url}: Page contains 'suspended' or 'denied'")
+                failed.append(url)
+                await page.close()
+                return
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"skipping: {e}")
+        failed.append(url)
+        await page.close()
+        return
+
+    phone_selectors = [
+        'input[type="tel" i]',
+        'input[name*="phone" i]',
+        'input[name*="mobile" i]',
+        'input[name*="cell" i]',
+        'input[class*="phone" i]',
+        'input[class*="mobile" i]',
+        'input[placeholder*="تلفن"]',
+        'input[placeholder*="موبایل"]',
+        'input[placeholder*="09"]',
+        'input[id*="username" i]',
+        'input[class*="username" i]',
+        'input[type="number" i]',
+        'input[name="digits_reg_mobilenum"]',
+        'input[name="digits_phone"]',
+        'input[class*="digi-"]',
+    ]
+
+    action = await find_register_element(page)  # Make sure this helper exists
+    if action:
+        await human_click(action)  # Make sure this helper exists
+    else:
+        print(f"Could not find an account action for {url}")
+        failed.append(url)
+        await page.close()
+        return
+
+    try:
+        pattern = re.compile(
+            r"(ثبت.*نام)|(عضویت)|(ایجاد یک حساب کاربری)|(ایجاد حساب کاربری)"
+        )
+        register_link = page.locator("a", has_text=pattern)
+        await human_click(register_link)
+        await page.wait_for_selector(
+            ", ".join(phone_selectors), state="visible", timeout=5000
+        )
+    except Exception:
+        pass
+
+    phone_input = (
+        page.locator(", ".join(phone_selectors)).or_(
+            page.locator(
+                "xpath=//input["
+                'preceding-sibling::*[contains(text(), "شماره تماس") or contains(text(), "شماره موبایل") or contains(text(), "شماره تلفن")] or '
+                'following-sibling::*[contains(text(), "شماره تماس") or contains(text(), "شماره موبایل") or contains(text(), "شماره تلفن")]'
+                "]"
             )
+        )
+    ).first
+
+    form = phone_input.locator("xpath=./ancestor::form").first
+
+    if not await form.count():
+        form = phone_input.locator(
+            "xpath=./ancestor::div[contains(@class, 'login') or contains(@class, 'register') or contains(@class, 'auth') or contains(@class, 'digits-login') or contains(@class, 'c-login') or contains(@class, 'auth-form')]"
         ).first
 
-        form = phone_input.locator("xpath=./ancestor::form").first
+    if not await form.count():
+        form = page.locator("html")
 
-        if not await form.count():
-            form = phone_input.locator(
-                "xpath=./ancestor::div[contains(@class, 'login') or contains(@class, 'register') or contains(@class, 'auth') or contains(@class, 'digits-login') or contains(@class, 'c-login') or contains(@class, 'auth-form')]"
-            ).first
+    submit_regex = re.compile(
+        r"تایید|ورود|ادامه|ثبت|ارسال|مرحله|submit|login|continue|next|send",
+        re.IGNORECASE,
+    )
 
-        if not await form.count():
-            form = page.locator("html")
-
-        submit_regex = re.compile(
-            r"تایید|ورود|ادامه|ثبت|ارسال|مرحله|submit|login|continue|next|send",
-            re.IGNORECASE,
+    button = (
+        form.locator(
+            'button, input[type="submit"], input[type="button"], [role="button"]'
         )
+        .filter(has_text=submit_regex)
+        .first
+    )
 
+    if not await button.count() or not await button.is_visible():
         button = (
-            form.locator(
-                'button, input[type="submit"], input[type="button"], [role="button"]'
-            )
-            .filter(has_text=submit_regex)
+            form.locator('button[type="submit"]')
+            .or_(form.locator("div#login-button"))
             .first
         )
 
-        if not await button.count() or not await button.is_visible():
-            button = (
-                form.locator('button[type="submit"]')
-                .or_(form.locator("div#login-button"))
-                .first
-            )
+    csrf_page = page.url
 
-        csrf_page = page.url
+    try:
+        captured_requests.clear()
+        is_listening = True
 
-        try:
-            captured_requests.clear()
-            is_listening = True
+        csrf = await extract_csrf_from_page(page)  # Make sure this helper exists
 
-            csrf = await extract_csrf_from_page(page)  # Make sure this helper exists
+        for step in range(3):
+            await fill_preset_fields(form)  # Make sure this helper exists
 
-            for step in range(3):
-                await fill_preset_fields(form)  # Make sure this helper exists
-
-                if await phone_input.count() and await phone_input.is_visible():
-                    await human_type(
-                        phone_input, f"0{phone_number}"
-                    )  # Make sure this helper exists
-                    break
-
-                if await button.count() and await button.is_visible():
-                    await human_click(button)
-                    await page.wait_for_timeout(1000)
-                else:
-                    break
-
-            await fill_preset_fields(form)
-
-            print("Clicking the final submit button...")
-            if await button.is_visible():
-                await human_click(button)
-
-            if await has_validation_errors(form):  # Make sure this helper exists
-                raise RuntimeError("Form could not be filled")
-
-            await page.wait_for_timeout(1000)
-
-            found = False
-            for req_dict in captured_requests:
-                req_str = json.dumps(req_dict)
-                if phone_number not in req_str:
-                    continue
-
-                request_csrf = extract_csrf_from_request(
-                    req_dict.get("Request", {})
+            if await phone_input.count() and await phone_input.is_visible():
+                await human_type(
+                    phone_input, f"0{phone_number}"
                 )  # Make sure this helper exists
-
-                all_tokens = {}
-                for t in request_csrf + csrf:
-                    if t["value"] not in all_tokens:
-                        all_tokens[t["value"]] = t
-                merged_csrf = list(all_tokens.values())
-
-                req_str = req_str.replace(phone_number, "{{phone_number}}")
-
-                used_tokens = []
-                for c in merged_csrf:
-                    val = c["value"]
-                    if val and val in req_str:
-                        idx = len(used_tokens)
-                        req_str = req_str.replace(val, f"{{{{csrf_token{idx}}}}}")
-                        used_tokens.append(c)
-
-                parsed = json.loads(req_str)
-
-                if used_tokens:
-                    parsed["HasCSRF"] = True
-                    parsed["CSRF"] = used_tokens
-                    parsed["CSRFPage"] = csrf_page
-                else:
-                    parsed["HasCSRF"] = False
-
-                # --- NEW: Live JSON Updates safely locked ---
-                async with file_lock:
-                    sms_requests.append(parsed)
-                    # Use a background thread so disk I/O doesn't block Playwright
-                    await asyncio.to_thread(save_live_data, sms_requests)
-
-                print(f"[+] Found and LIVE SAVED SMS endpoint for {url}")
-                found = True
                 break
 
-            if not found:
-                failed.append(url)
-                logs = Path("./logs")
-                if (
-                    not logs.exists()
-                ):  # Fixed logic so it doesn't delete existing logs from other tasks
-                    logs.mkdir(exist_ok=True)
+            if await button.count() and await button.is_visible():
+                await human_click(button)
+                await page.wait_for_timeout(1000)
+            else:
+                break
 
-                filename = (
-                    url.replace(".", "_")
-                    .replace("http://", "")
-                    .replace("https://", "")
-                    .replace("/", "")
-                    .replace("\\", "")
-                    + ".txt"
-                )
+        await fill_preset_fields(form)
 
-                # FIXED: Close file automatically using 'with' block
-                with open(logs / filename, "w", encoding="utf-8") as log_f:
-                    json.dump(captured_requests, log_f, indent=4)
+        print("Clicking the final submit button...")
+        if await button.is_visible():
+            await human_click(button)
 
-                print(f"Did not find SMS endpoint for {url}, skipping")
+        if await has_validation_errors(form):  # Make sure this helper exists
+            raise RuntimeError("Form could not be filled")
 
-        except TimeoutError:
+        await page.wait_for_timeout(1000)
+
+        found = False
+        for req_dict in captured_requests:
+            req_str = json.dumps(req_dict)
+            if phone_number not in req_str:
+                continue
+
+            request_csrf = extract_csrf_from_request(
+                req_dict.get("Request", {})
+            )  # Make sure this helper exists
+
+            all_tokens = {}
+            for t in request_csrf + csrf:
+                if t["value"] not in all_tokens:
+                    all_tokens[t["value"]] = t
+            merged_csrf = list(all_tokens.values())
+
+            req_str = req_str.replace(phone_number, "{{phone_number}}")
+
+            used_tokens = []
+            for c in merged_csrf:
+                val = c["value"]
+                if val and val in req_str:
+                    idx = len(used_tokens)
+                    req_str = req_str.replace(val, f"{{{{csrf_token{idx}}}}}")
+                    used_tokens.append(c)
+
+            parsed = json.loads(req_str)
+
+            if used_tokens:
+                parsed["HasCSRF"] = True
+                parsed["CSRF"] = used_tokens
+                parsed["CSRFPage"] = csrf_page
+            else:
+                parsed["HasCSRF"] = False
+
+            # --- NEW: Live JSON Updates safely locked ---
+            async with file_lock:
+                sms_requests.append(parsed)
+                # Use a background thread so disk I/O doesn't block Playwright
+                await asyncio.to_thread(save_live_data, sms_requests)
+
+            print(f"[+] Found and LIVE SAVED SMS endpoint for {url}")
+            found = True
+            break
+
+        if not found:
             failed.append(url)
-            print(f"Timeout for {url}")
-        finally:
-            is_listening = False
-            try:
-                await page.close()
-            except Exception:
-                pass
+            logs = Path("./logs")
+            if (
+                not logs.exists()
+            ):  # Fixed logic so it doesn't delete existing logs from other tasks
+                logs.mkdir(exist_ok=True)
+
+            filename = (
+                url.replace(".", "_")
+                .replace("http://", "")
+                .replace("https://", "")
+                .replace("/", "")
+                .replace("\\", "")
+                + ".txt"
+            )
+
+            # FIXED: Close file automatically using 'with' block
+            with open(logs / filename, "w", encoding="utf-8") as log_f:
+                json.dump(captured_requests, log_f, indent=4)
+
+            print(f"Did not find SMS endpoint for {url}, skipping")
+
+    except TimeoutError:
+        failed.append(url)
+        print(f"Timeout for {url}")
+    finally:
+        is_listening = False
+        with contextlib.suppress(Exception):
+            await context.close()  # closes page + frees all buffers
 
     # --- NEW: Log this URL as processed so we can skip it if the script restarts ---
     async with processed_lock:
@@ -568,6 +558,18 @@ async def process_website(
         await asyncio.to_thread(append_processed)
 
 
+BROWSER_RECYCLE_EVERY = 300
+
+# Chromium args that matter for long, headless server runs.
+CHROMIUM_ARGS = [
+    "--disable-dev-shm-usage",  # avoids /dev/shm exhaustion -> sudden timeouts
+    "--no-sandbox",  # needed in most Docker/root server envs
+    "--disable-gpu",
+    "--disable-extensions",
+    "--no-first-run",
+]
+
+
 async def run(phone_number: str, urls: list[str]):
     file_lock = asyncio.Lock()
     processed_lock = asyncio.Lock()
@@ -575,7 +577,7 @@ async def run(phone_number: str, urls: list[str]):
     sms_requests: list[dict] = []
     processed_urls: set[str] = set()
 
-    # --- NEW: Crash Recovery - Load existing SMS data ---
+    # --- Crash Recovery: Load existing SMS data ---
     if os.path.exists("sms.json"):
         try:
             with open("sms.json", "r", encoding="utf-8") as f:
@@ -584,62 +586,115 @@ async def run(phone_number: str, urls: list[str]):
         except json.JSONDecodeError:
             print("Warning: sms.json was corrupted. Starting fresh.")
 
-    # --- NEW: Crash Recovery - Skip already processed URLs ---
+    # --- Crash Recovery: Skip already processed URLs ---
     if os.path.exists("processed_urls.txt"):
         with open("processed_urls.txt", "r", encoding="utf-8") as f:
             processed_urls = {line.strip() for line in f if line.strip()}
         print(f"Found {len(processed_urls)} already processed URLs. Skipping them.")
 
-    try:
-        async with Stealth().use_async(async_playwright()) as p:
-            browser = await p.chromium.launch(headless=True)
+    # --- Build the work queue (skip already-done URLs) ---
+    queue: asyncio.Queue = asyncio.Queue()
+    for i, url in enumerate(urls):
+        if url not in processed_urls:
+            queue.put_nowait((i, url))
 
-            tasks = []
-            for i, url in enumerate(urls):
-                if url in processed_urls:
-                    continue  # Skip if we already did this one before the power went out
+    total_urls = len(urls)
+    remaining = queue.qsize()
+    print(f"Queued {remaining} URLs to process ({total_urls} total).")
 
-                tasks.append(
-                    process_website(
+    if remaining == 0:
+        print("Nothing to do. All URLs already processed.")
+        return
+
+    # --- Browser lifecycle managed via a swappable holder ---
+    # We keep the current browser in a 1-element list so workers always
+    # read the latest instance after a recycle.
+    browser_holder: list = [None]
+    browser_lock = asyncio.Lock()  # serialize launch/relaunch
+    processed_count = 0  # pages finished since last recycle
+    count_lock = asyncio.Lock()
+
+    async with Stealth().use_async(async_playwright()) as p:
+
+        async def launch_browser():
+            return await p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+
+        async def maybe_recycle_browser():
+            """Relaunch Chromium once enough pages have been processed."""
+            nonlocal processed_count
+            async with count_lock:
+                processed_count += 1
+                if processed_count < BROWSER_RECYCLE_EVERY:
+                    return
+                processed_count = 0  # reset before doing the (slow) swap
+
+            # Swap the browser under the browser_lock so workers grabbing it
+            # mid-recycle either get the old (still-open) or new instance.
+            async with browser_lock:
+                old = browser_holder[0]
+                print("[*] Recycling Chromium to free memory...")
+                new = await launch_browser()
+                browser_holder[0] = new
+                # Give in-flight pages on the old browser a moment, then close.
+                if old is not None:
+                    with contextlib.suppress(Exception):
+                        await old.close()
+                print("[*] Chromium recycled.")
+
+        async def get_browser():
+            async with browser_lock:
+                return browser_holder[0]
+
+        # Initial launch
+        browser_holder[0] = await launch_browser()
+
+        async def worker(worker_id: int):
+            while True:
+                try:
+                    i, url = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    browser = await get_browser()
+                    await process_website(
                         browser,
                         i,
                         url,
                         phone_number,
                         sms_requests,
-                        len(urls),
+                        total_urls,
                         file_lock,
                         processed_lock,
                     )
-                )
+                except asyncio.CancelledError:
+                    # Re-queue so a restart can pick it up; don't mark processed.
+                    raise
+                except Exception as e:
+                    print(f"[worker {worker_id}] Task error for {url}: {e!r}")
+                finally:
+                    queue.task_done()
+                    await maybe_recycle_browser()
 
-            # Run tasks concurrently
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in results:
-                if isinstance(r, Exception):
-                    print(f"Task error: {r!r}")
-
-    except asyncio.CancelledError:
-        print("\n[!] Task was cancelled.")
-    except KeyboardInterrupt:
-        print("\n[!] Ctrl+C detected. Shutting down safely...")
-    finally:
-        print("\nSaving final state...")
-        try:
-            save_live_data(sms_requests)
-        except Exception as e:
-            print(f"Final save failed: {e}")
+        workers = [asyncio.create_task(worker(w)) for w in range(CONCURRENCY_LIMIT)]
 
         try:
-            await context.close()
-        except Exception as e:
-            print(f"Context close failed (already dead?): {e}")
+            await asyncio.gather(*workers)
+        except asyncio.CancelledError:
+            print("\n[!] Cancellation received. Stopping workers...")
+            for w in workers:
+                w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+        finally:
+            print("\nSaving final state...")
+            with contextlib.suppress(Exception):
+                save_live_data(sms_requests)
 
-        try:
-            await browser.close()
-        except Exception as e:
-            print(f"Browser close failed: {e}")
+            with contextlib.suppress(Exception):
+                if browser_holder[0] is not None:
+                    await browser_holder[0].close()
 
-        print(f"\nTotal captured SMS endpoints: {len(sms_requests)}")
+            print(f"\nTotal captured SMS endpoints: {len(sms_requests)}")
 
 
 if __name__ == "__main__":
