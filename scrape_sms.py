@@ -590,7 +590,7 @@ async def run(phone_number: str, urls: list[str]):
 
     try:
         async with Stealth().use_async(async_playwright()) as p:
-            browser = await p.firefox.launch(headless=True)
+            browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(ignore_https_errors=True)
 
             tasks = []
