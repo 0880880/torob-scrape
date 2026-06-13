@@ -18,7 +18,7 @@ from playwright_stealth import Stealth
 from stealth import human_click, human_type
 
 CSRF_KEY_RE = re.compile(
-    r"csrf|xsrf|token|nonce|authenticity|_wpnonce|csrfmiddlewaretoken|yii_csrf",
+    r"altcha|csrf|xsrf|token|nonce|authenticity|_wpnonce|csrfmiddlewaretoken|yii_csrf",
     re.IGNORECASE,
 )
 
@@ -85,7 +85,7 @@ async def extract_csrf_from_page(page: Page) -> list:
         const tokens = [];
 
         // Mirror of the Python CSRF_KEY_RE
-        const CSRF_RE = /csrf|xsrf|token|nonce|authenticity|_wpnonce|csrfmiddlewaretoken|yii_csrf/i;
+        const CSRF_RE = /altcha|csrf|xsrf|token|nonce|authenticity|_wpnonce|csrfmiddlewaretoken|yii_csrf/i;
         function matchesPatterns(s) {
             return typeof s === 'string' && CSRF_RE.test(s);
         }
